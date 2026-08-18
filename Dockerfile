@@ -14,6 +14,7 @@ COPY main.py inference.py preprocessing.py /opt/app/
 COPY modeling /opt/app/modeling
 COPY ta36 /opt/app/ta36
 COPY vendor/nnunetv2 /opt/app/nnunetv2
+COPY vendor/dynamic_network_architectures /opt/app/dynamic_network_architectures
 
 RUN chown -R user:user /opt/app
 USER user
