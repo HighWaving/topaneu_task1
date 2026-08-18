@@ -120,8 +120,15 @@ def _run_official_ta36(image: sitk.Image, work_dir: Path) -> tuple[Path, Path]:
     print("===== Official TA36 stderr =====", file=sys.stderr, flush=True)
     print(result.stderr or "", file=sys.stderr, flush=True)
     if result.returncode != 0:
+        stdout = result.stdout or "<empty>"
+        stderr = result.stderr or "<empty>"
         raise RuntimeError(
-            f"Official TA36 subprocess failed with exit code {result.returncode}"
+            "Official TA36 subprocess failed\n"
+            f"return code: {result.returncode}\n"
+            "===== Official TA36 stdout =====\n"
+            f"{stdout}\n"
+            "===== Official TA36 stderr =====\n"
+            f"{stderr}"
         )
     vessel_path = output_dir / "case.nii.gz"
     if not vessel_path.is_file():
