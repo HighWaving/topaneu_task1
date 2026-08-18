@@ -75,12 +75,40 @@ def _load_model() -> TopAneuVesselAwareClassifier:
     return _MODEL
 
 
+def _resolve_ta36_model_root() -> Path:
+    subdirs = [
+        "resEncM_ceW_bg0.75_max1.5_diff_cluster_noMirror_bs2_ps80_192_128_allLR1e-2_clsBalSamp_degree0.75_noTopcowPretrain_ep1000_DS3",
+        "plain_conv_ceW_bg0.5_max2.5_diff_cluster_noMirror_bs2_ps80_192_128_allLR1e-2_clsBalSamp_degree0.75_noTopcowPretrain_ep1000_DS3",
+        "primusV3S_ceW_bg0.5_max2.5_diff_cluster_noMirror_bs2_ps80_192_128_clsBalSamp_degree0.75_warm50_ep1000_DS",
+    ]
+    candidates = [
+        TA36_MODEL_ROOT,
+        MODEL_ROOT / "ta36",
+        MODEL_ROOT / "Dataset572_TopAneu_Vessel_36fgCls_wLRSwap",
+        MODEL_ROOT,
+        APP_ROOT / "ta36" / "data" / "results" / "Dataset572_TopAneu_Vessel_36fgCls_wLRSwap",
+    ]
+    for cand in candidates:
+        if cand.is_dir() and all((cand / d).is_dir() for d in subdirs):
+            print(f"[TA36] Located model weights at: {cand}", flush=True)
+            return cand
+
+    print("[TA36] Candidate path search details:", flush=True)
+    for cand in candidates:
+        print(f"  candidate: {cand} (exists={cand.exists()}, is_dir={cand.is_dir()})", flush=True)
+    if MODEL_ROOT.exists():
+        print(f"[TA36] Files in MODEL_ROOT ({MODEL_ROOT}):", flush=True)
+        for item in sorted(MODEL_ROOT.rglob("*"))[:50]:
+            print(f"  {item.relative_to(MODEL_ROOT)} (is_dir={item.is_dir()})", flush=True)
+    return TA36_MODEL_ROOT
+
+
 def _run_official_ta36(image: sitk.Image, work_dir: Path) -> tuple[Path, Path]:
     raw_path = work_dir / "raw.nii.gz"
     input_dir = work_dir / "ta36_input"
     output_dir = work_dir / "ta36_output"
-    input_dir.mkdir()
-    output_dir.mkdir()
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     sitk.WriteImage(image, str(raw_path), True)
 
     original = nib.load(str(raw_path))
@@ -90,8 +118,15 @@ def _run_official_ta36(image: sitk.Image, work_dir: Path) -> tuple[Path, Path]:
     if "".join(nib.aff2axcodes(lps_image.affine)) != "LPS":
         raise RuntimeError("failed to reorient input to LPS")
 
+    resolved_ta36_root = _resolve_ta36_model_root()
     environment = os.environ.copy()
-    environment["TOPANEU_MODEL_ROOT"] = str(TA36_MODEL_ROOT)
+    environment["TOPANEU_MODEL_ROOT"] = str(resolved_ta36_root)
+    environment["PYTHONUNBUFFERED"] = "1"
+    pythonpath = str(APP_ROOT)
+    if "PYTHONPATH" in environment:
+        pythonpath = f"{pythonpath}:{environment['PYTHONPATH']}"
+    environment["PYTHONPATH"] = pythonpath
+
     command = [
         sys.executable,
         str(TA36_SCRIPT),
@@ -107,7 +142,26 @@ def _run_official_ta36(image: sitk.Image, work_dir: Path) -> tuple[Path, Path]:
         "--n_pre_post_workers",
         "1",
     ]
-    subprocess.run(command, check=True, cwd=APP_ROOT, env=environment)
+    print(f"[TA36] Executing TA36 inference: {' '.join(command)}", flush=True)
+    result = subprocess.run(
+        command,
+        cwd=APP_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    if result.stdout:
+        print(f"[TA36 STDOUT]\n{result.stdout}", flush=True)
+    if result.stderr:
+        print(f"[TA36 STDERR]\n{result.stderr}", file=sys.stderr, flush=True)
+    if result.returncode != 0:
+        error_msg = (
+            f"Official TA36 subprocess failed with return code {result.returncode}.\n"
+            f"=== SUBPROCESS STDOUT ===\n{result.stdout}\n"
+            f"=== SUBPROCESS STDERR ===\n{result.stderr}\n"
+        )
+        raise RuntimeError(error_msg)
+
     vessel_path = output_dir / "case.nii.gz"
     if not vessel_path.is_file():
         raise RuntimeError(f"Official TA36 did not produce {vessel_path}")
