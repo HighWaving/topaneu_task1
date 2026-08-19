@@ -1,4 +1,6 @@
 import importlib
+import os
+from os.path import join
 import pkgutil
 
 from batchgenerators.utilities.file_and_folder_operations import *
@@ -12,7 +14,8 @@ def recursive_find_python_class(folder: str, class_name: str, current_module: st
             try:
                 m = importlib.import_module(current_module + "." + modname)
             except (ImportError, ModuleNotFoundError) as e:
-                # Skip modules with missing optional dependencies
+                # Skip modules with missing optional dependencies, but log warning
+                print(f"[find_class_by_name] Warning: could not import {current_module}.{modname}: {e}", flush=True)
                 continue
             if hasattr(m, class_name):
                 tr = getattr(m, class_name)

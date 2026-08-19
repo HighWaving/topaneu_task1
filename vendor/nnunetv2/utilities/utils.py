@@ -14,7 +14,7 @@
 #    limitations under the License.
 import os.path
 from functools import lru_cache
-from typing import Union
+from typing import Union, List, Tuple
 
 from batchgenerators.utilities.file_and_folder_operations import *
 import numpy as np

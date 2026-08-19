@@ -3,7 +3,10 @@ from batchgenerators.utilities.file_and_folder_operations import join
 from collections import defaultdict
 
 matplotlib.use('agg')
-import seaborn as sns
+try:
+    import seaborn as sns
+except (ImportError, ModuleNotFoundError):
+    sns = None
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
@@ -46,7 +49,8 @@ class MetricLogger(object):
     def plot_progress_png(self, output_folder):
         # we infer the epoch form our internal logging
         epoch = min([len(i) for i in self.my_fantastic_logging.values()]) - 1  # lists of epoch 0 have len 1
-        sns.set(font_scale=2.5)
+        if sns is not None:
+            sns.set(font_scale=2.5)
         fig, ax_all = plt.subplots(3, 1, figsize=(30, 54))
         # regular progress.png as we are used to from previous nnU-Net versions
         ax = ax_all[0]

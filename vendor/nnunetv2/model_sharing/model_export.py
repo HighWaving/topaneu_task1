@@ -1,3 +1,4 @@
+from typing import Union, Tuple, List
 import zipfile
 
 from nnunetv2.utilities.file_path_utilities import *
