@@ -96,10 +96,13 @@ def get_predictors(model_cfg, predictor_class, use_mirroring, device_id=0):
             verbose_preprocessing=False,
             allow_tqdm=True
         )
+        predictor.perform_everything_on_device = False
         subdir = m_cfg['subdir']
         model_fold = m_cfg['model_fold']
         checkpoint_name = m_cfg['ckpt_name']
         predictor.initialize_from_trained_model_folder(f"{base_model_dir}/{subdir}", use_folds=(model_fold,), checkpoint_name=checkpoint_name)
+        predictor.network = predictor.network.to('cpu')
+        torch.cuda.empty_cache()
         logger.info(f'[{subdir}] Original Patch Size: {predictor.configuration_manager.patch_size}')
         if m_cfg.get('patch_size') is not None:
             predictor.configuration_manager.configuration["patch_size"] = m_cfg['patch_size']
@@ -196,7 +199,7 @@ def _streamed_seg_from_sources(sources, n_sources, pm, cm, lm, props, fp16=False
 
 
 @torch.inference_mode()
-def predict_and_fuse(predictors, preprocessed_dicts, plans_managers, configuration_managers, label_managers, fuse_logits=False, fp16=False, streamed=True, verbose=False):
+def predict_and_fuse(predictors, preprocessed_dicts, plans_managers, configuration_managers, label_managers, fuse_logits=False, fp16=True, streamed=True, verbose=False):
     """Predict all models on one preprocessed case and fuse into a segmentation (uint8,
     original array layout). Returns None if there is nothing to predict.
 
@@ -244,17 +247,27 @@ def predict_and_fuse(predictors, preprocessed_dicts, plans_managers, configurati
             logger.info("[predict_and_fuse] separate-z resampling or region labels: falling back to full-volume export")
 
     def iter_logits():
+        import gc
+        shared_data = preprocessed_dicts[0]['data']
+        if not isinstance(shared_data, torch.Tensor):
+            shared_data = torch.from_numpy(np.ascontiguousarray(shared_data))
         for predictor, dct in zip(predictors, preprocessed_dicts):
-            data = dct['data']
-            if not isinstance(data, torch.Tensor):
-                data = torch.from_numpy(np.ascontiguousarray(data))
-            logits = predictor.predict_logits_from_preprocessed_data(data, reload_model_weight=False, to_cpu=True).float()
-            dct['data'] = None  # free preprocessed data as soon as it is consumed
-            del data
+            predictor.network = predictor.network.to(predictor.device)
+            logits = predictor.predict_logits_from_preprocessed_data(shared_data, reload_model_weight=False, to_cpu=True)
+            if not fp16:
+                logits = logits.float()
+            predictor.network = predictor.network.to('cpu')
+            torch.cuda.empty_cache()
+            gc.collect()
             yield logits
             # on resume, drop this frame's reference before the next model predicts;
             # otherwise the previous logits stay alive throughout that prediction
             del logits
+            gc.collect()
+        del shared_data
+        for dct in preprocessed_dicts:
+            dct['data'] = None
+        gc.collect()
 
     if fuse_logits:
         fused = None
@@ -663,7 +676,7 @@ def post_process_folder(in_dir, out_dir, suffix='.nii.gz', post_process_func=Non
     logger.info(f"Post-processing done, {time.time()-st :.0f}s")
 
 @torch.inference_mode()
-def infer_one_sample(input_file, output_file, casename, predictors, post_process=True, prune_fn_name='rm_small', post_process_func=None, fuse_logits=False, fp16=False):
+def infer_one_sample(input_file, output_file, casename, predictors, post_process=True, prune_fn_name='rm_small', post_process_func=None, fuse_logits=False, fp16=True):
     print(f"Predicting {input_file} ...")
     print(f"\tcasename: {casename}")
 
@@ -678,21 +691,25 @@ def infer_one_sample(input_file, output_file, casename, predictors, post_process
     print(f"[*] ITK image spacing after x-z Transposed: {spacing_for_nnunet}")
 
     print("[*] preprocessing...")
-    preprocessed_dicts = []
-    for predictor in predictors:
-        ppa = PreprocessAdapterFromNpy([input_array], [None], [props], [None],
-                                       predictor.plans_manager, predictor.dataset_json, predictor.configuration_manager,
-                                       num_threads_in_multithreaded=1, verbose=False)
-        preprocessed_dicts.append(next(ppa))
+    import gc
+    ppa = PreprocessAdapterFromNpy([input_array], [None], [props], [None],
+                                   predictors[0].plans_manager, predictors[0].dataset_json, predictors[0].configuration_manager,
+                                   num_threads_in_multithreaded=1, verbose=False)
+    preprocessed_dict = next(ppa)
+    del input_array, ppa
+    gc.collect()
+
+    preprocessed_dicts = [preprocessed_dict for _ in predictors]
 
     print("[*] prediction...")
-    del input_array  # the preprocessed copies are what matters from here on
     seg = predict_and_fuse(
         predictors, preprocessed_dicts,
         [p.plans_manager for p in predictors],
         [p.configuration_manager for p in predictors],
         [p.label_manager for p in predictors],
         fuse_logits=fuse_logits, fp16=fp16)
+    del preprocessed_dicts, preprocessed_dict
+    gc.collect()
     print(f"[*] Ensemble fused seg shape: {seg.shape}")
 
     if post_process:
@@ -720,7 +737,7 @@ def infer_folder(
     skip_existing=False,
     sequential=False,
     queue1_size=12, queue2_size=12, n_preprocess_workers=6, n_infer_workers=1, n_post_inference_workers=6,
-    n_gpus=1, gpu_limit_GB=None, fuse_logits=False, fp16=False
+    n_gpus=1, gpu_limit_GB=None, fuse_logits=False, fp16=True
 ):
     st0 = time.time()
 

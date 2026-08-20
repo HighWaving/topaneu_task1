@@ -635,10 +635,34 @@ class nnUNetPredictor(object):
             # preallocate arrays
             if self.verbose:
                 print(f'preallocating results arrays on device {results_device}')
-            predicted_logits = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
-                                           dtype=torch.half,
-                                           device=results_device)
-            n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
+            tmp_logits_path = None
+            tmp_npred_path = None
+            if results_device.type == 'cpu':
+                import tempfile
+                num_logits_elems = self.label_manager.num_segmentation_heads * int(np.prod(data.shape[1:]))
+                tmp_logits_file = tempfile.NamedTemporaryFile(dir='/tmp', prefix='nnunet_logits_', delete=False)
+                tmp_logits_path = tmp_logits_file.name
+                tmp_logits_file.close()
+                with open(tmp_logits_path, 'wb') as f:
+                    f.seek(num_logits_elems * 2 - 1)
+                    f.write(b'\0')
+                predicted_logits = torch.from_file(tmp_logits_path, shared=True, size=num_logits_elems, dtype=torch.half).view((self.label_manager.num_segmentation_heads, *data.shape[1:]))
+                predicted_logits.zero_()
+
+                num_npred_elems = int(np.prod(data.shape[1:]))
+                tmp_npred_file = tempfile.NamedTemporaryFile(dir='/tmp', prefix='nnunet_npred_', delete=False)
+                tmp_npred_path = tmp_npred_file.name
+                tmp_npred_file.close()
+                with open(tmp_npred_path, 'wb') as f:
+                    f.seek(num_npred_elems * 2 - 1)
+                    f.write(b'\0')
+                n_predictions = torch.from_file(tmp_npred_path, shared=True, size=num_npred_elems, dtype=torch.half).view(data.shape[1:])
+                n_predictions.zero_()
+            else:
+                predicted_logits = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
+                                               dtype=torch.half,
+                                               device=results_device)
+                n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
 
             if self.use_gaussian:
                 gaussian = compute_gaussian(tuple(self.configuration_manager.patch_size), sigma_scale=1. / 8,
@@ -661,6 +685,13 @@ class nnUNetPredictor(object):
                 n_predictions[sl[1:]] += gaussian
 
             predicted_logits /= n_predictions
+            del n_predictions
+            if tmp_npred_path and os.path.exists(tmp_npred_path):
+                try:
+                    os.remove(tmp_npred_path)
+                except Exception:
+                    pass
+
             # check for infs
             if torch.any(torch.isinf(predicted_logits)):
                 raise RuntimeError('Encountered inf in predicted array. Aborting... If this problem persists, '
@@ -668,6 +699,16 @@ class nnUNetPredictor(object):
                                    'predicted_logits to fp32')
         except Exception as e:
             del predicted_logits, n_predictions, prediction, gaussian, workon
+            if tmp_logits_path and os.path.exists(tmp_logits_path):
+                try:
+                    os.remove(tmp_logits_path)
+                except Exception:
+                    pass
+            if tmp_npred_path and os.path.exists(tmp_npred_path):
+                try:
+                    os.remove(tmp_npred_path)
+                except Exception:
+                    pass
             empty_cache(self.device)
             empty_cache(results_device)
             raise e
