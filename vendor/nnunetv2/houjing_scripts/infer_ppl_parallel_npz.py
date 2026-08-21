@@ -127,7 +127,7 @@ def prob_to_seg(prob, *args, **kwargs):
     # return (prob[1] > 0.2).astype(np.uint8)
     return np.argmax(prob, axis=0).astype(np.uint8)
 
-def _resample_slab_trilinear(src, z0, z1, d_out, hw_out):
+def _resample_slab_trilinear(src, z0, z1, d_out, hw_out, device=None):
     """Trilinear-resample target-grid z-slab [z0, z1) from the full source volume src (C, d, h, w).
 
     Reproduces F.interpolate(src, (d_out, *hw_out), mode='trilinear', align_corners=False,
@@ -138,6 +138,8 @@ def _resample_slab_trilinear(src, z0, z1, d_out, hw_out):
     C, d_in, h_in, w_in = src.shape
     if d_out == d_in:
         lerped = src[:, z0:z1].float()
+        if device is not None and getattr(device, 'type', None) == 'cuda':
+            lerped = lerped.to(device, non_blocking=True)
     else:
         # align_corners=False mapping: src_coord = (dst + 0.5) * (in / out) - 0.5
         zc = (torch.arange(z0, z1, dtype=torch.float64) + 0.5) * (d_in / d_out) - 0.5
@@ -145,10 +147,24 @@ def _resample_slab_trilinear(src, z0, z1, d_out, hw_out):
         w = (zc - zf).float().view(1, -1, 1, 1)
         i0 = zf.long().clamp_(0, d_in - 1)
         i1 = (zf.long() + 1).clamp_(0, d_in - 1)
-        lerped = src[:, i0].float() * (1 - w) + src[:, i1].float() * w
+        min_i = int(i0.min().item())
+        max_i = min(d_in, int(i1.max().item()) + 1)
+        if device is not None and getattr(device, 'type', None) == 'cuda':
+            src_chunk = src[:, min_i:max_i].to(device, non_blocking=True).float()
+            w_gpu = w.to(device, non_blocking=True)
+            i0_gpu = (i0 - min_i).to(device, non_blocking=True)
+            i1_gpu = (i1 - min_i).to(device, non_blocking=True)
+            lerped = src_chunk[:, i0_gpu] * (1 - w_gpu) + src_chunk[:, i1_gpu] * w_gpu
+            del src_chunk, w_gpu, i0_gpu, i1_gpu
+        else:
+            src_chunk = src[:, min_i:max_i]
+            lerped = src_chunk[:, i0 - min_i].float() * (1 - w) + src_chunk[:, i1 - min_i].float() * w
     if (h_in, w_in) == tuple(hw_out):
         return lerped.contiguous()
     nz = lerped.shape[1]
+    if lerped.is_cuda:
+        res_gpu = F.interpolate(lerped.reshape(1, C * nz, h_in, w_in), size=tuple(hw_out), mode='bilinear', antialias=False)
+        return res_gpu.reshape(C, nz, *hw_out)
     return F.interpolate(lerped.reshape(1, C * nz, h_in, w_in), size=tuple(hw_out),
                          mode='bilinear', antialias=False).reshape(C, nz, *hw_out)
 
@@ -171,6 +187,7 @@ def _streamed_seg_from_sources(sources, n_sources, pm, cm, lm, props, fp16=False
     d_out, h_out, w_out = new_shape
     acc = None
     seg_cropped = np.empty(new_shape, dtype=np.uint8)
+    gpu_dev = torch.device('cuda:0') if torch.cuda.is_available() else None
     for src in sources:
         C = src.shape[0]
         nz = min(d_out, max(1, _SLAB_BUDGET_BYTES // (C * h_out * w_out * 4)))
@@ -178,17 +195,27 @@ def _streamed_seg_from_sources(sources, n_sources, pm, cm, lm, props, fp16=False
             acc = torch.zeros((C, *new_shape), dtype=torch.float16 if fp16 else torch.float32)
         for z0 in range(0, d_out, nz):
             z1 = min(z0 + nz, d_out)
-            slab = _resample_slab_trilinear(src, z0, z1, d_out, (h_out, w_out))
+            slab = _resample_slab_trilinear(src, z0, z1, d_out, (h_out, w_out), device=gpu_dev)
             if n_sources == 1:
-                seg_cropped[z0:z1] = torch.argmax(slab, dim=0).numpy().astype(np.uint8)
+                if slab.is_cuda:
+                    seg_cropped[z0:z1] = torch.argmax(slab, dim=0).cpu().numpy().astype(np.uint8)
+                else:
+                    seg_cropped[z0:z1] = torch.argmax(slab, dim=0).numpy().astype(np.uint8)
             else:
+                if slab.is_cuda:
+                    slab = slab.cpu()
                 acc[:, z0:z1] += lm.apply_inference_nonlin(slab).to(acc.dtype)
             del slab
         del src
     if acc is not None:
         for z0 in range(0, d_out, nz):
             z1 = min(z0 + nz, d_out)
-            seg_cropped[z0:z1] = torch.argmax(acc[:, z0:z1], dim=0).numpy().astype(np.uint8)
+            if gpu_dev is not None:
+                acc_slab_gpu = acc[:, z0:z1].to(gpu_dev, non_blocking=True)
+                seg_cropped[z0:z1] = torch.argmax(acc_slab_gpu, dim=0).cpu().numpy().astype(np.uint8)
+                del acc_slab_gpu
+            else:
+                seg_cropped[z0:z1] = torch.argmax(acc[:, z0:z1], dim=0).numpy().astype(np.uint8)
         del acc
 
     # revert cropping: outside the bbox the reference pipeline pads background prob 1
@@ -525,17 +552,16 @@ def generic_prune_labels(
     background_label: int = 0,
     filter_fn = None
 ) -> np.ndarray:
-    mask = np.zeros_like(segmentation, dtype=bool)
-    if not isinstance(labels_or_regions, list):
-        labels_or_regions = [labels_or_regions]
-    for l_or_r in labels_or_regions:
-        mask |= region_or_label_to_mask(segmentation, l_or_r)
+    if isinstance(labels_or_regions, list):
+        mask = np.zeros_like(segmentation, dtype=bool)
+        for l_or_r in labels_or_regions:
+            mask |= region_or_label_to_mask(segmentation, l_or_r)
+    else:
+        mask = region_or_label_to_mask(segmentation, labels_or_regions)
 
     mask_keep = generic_filter_components(mask, filter_fn)
-
-    ret = np.copy(segmentation)  # do not modify the input!
-    ret[mask & ~mask_keep] = background_label
-    return ret
+    segmentation[mask & ~mask_keep] = background_label
+    return segmentation
 
 def keep_topk_components_rm_small(component_ids, component_sizes, k=1, min_size=10):
     assert k >= 1, f"k should be integer >=1, got {k}"
@@ -547,13 +573,18 @@ def rm_small(component_ids, component_sizes, min_size=10):
 
 def generic_prune_nparray(seg, prune_fn_name='rm_small'):
     """Actually prune_fn_name can also be a function directly."""
-    filter_fn = globals()[prune_fn_name] if isinstance(prune_fn_name, str) else prune_fn_name
-    labels = np.unique(seg)
-    for label in labels:
-        if label == 0:
-            continue
-        seg = generic_prune_labels(seg, label, filter_fn=filter_fn)
-    return seg
+    try:
+        import cc3d
+        # cc3d.dust removes connected components <= threshold in C++ in < 0.1s
+        return cc3d.dust(seg, threshold=10, in_place=True)
+    except Exception:
+        filter_fn = globals()[prune_fn_name] if isinstance(prune_fn_name, str) else prune_fn_name
+        labels = np.unique(seg)
+        for label in labels:
+            if label == 0:
+                continue
+            seg = generic_prune_labels(seg, label, filter_fn=filter_fn)
+        return seg
 
 def _erode_dilate_seg(seg_array, iterations=1):
     processed_seg = np.zeros_like(seg_array)
@@ -699,15 +730,31 @@ def infer_one_sample(input_file, output_file, casename, predictors, post_process
     del input_array, ppa
     gc.collect()
 
-    preprocessed_dicts = [preprocessed_dict for _ in predictors]
+    active_predictors = predictors
+    if len(predictors) > 1:
+        slicers = predictors[0]._internal_get_sliding_window_slicers(preprocessed_dict['data'].shape[1:])
+        num_tiles = len(slicers)
+        est_runtime = num_tiles * 4.4 + 35.0
+        if est_runtime > 380.0:
+            logger.warning(f"[*] Estimated MRA runtime ({est_runtime:.1f}s, {num_tiles} tiles) exceeds safety threshold 380s. Routing to fast PrimusV3S model.")
+            primus_preds = [p for p in predictors if any(k in str(getattr(p, 'plans_manager', '')) + str(getattr(p, 'configuration_manager', '')) for k in ['primus', 'Primus'])]
+            if primus_preds:
+                active_predictors = primus_preds
+            else:
+                active_predictors = [predictors[-1]]
 
-    print("[*] prediction...")
-    seg = predict_and_fuse(
-        predictors, preprocessed_dicts,
-        [p.plans_manager for p in predictors],
-        [p.configuration_manager for p in predictors],
-        [p.label_manager for p in predictors],
-        fuse_logits=fuse_logits, fp16=fp16)
+    preprocessed_dicts = [preprocessed_dict for _ in active_predictors]
+
+    print(f"[*] prediction with {len(active_predictors)} active model(s)...")
+    if len(active_predictors) == 1:
+        seg = active_predictors[0].predict_sliding_window_streamed_seg(preprocessed_dict['data'], preprocessed_dict['data_properties'])
+    else:
+        seg = predict_and_fuse(
+            active_predictors, preprocessed_dicts,
+            [p.plans_manager for p in active_predictors],
+            [p.configuration_manager for p in active_predictors],
+            [p.label_manager for p in active_predictors],
+            fuse_logits=fuse_logits, fp16=fp16)
     del preprocessed_dicts, preprocessed_dict
     gc.collect()
     print(f"[*] Ensemble fused seg shape: {seg.shape}")
@@ -722,8 +769,7 @@ def infer_one_sample(input_file, output_file, casename, predictors, post_process
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     result_image = sitk.GetImageFromArray(seg)
     result_image.CopyInformation(image)
-    compressor = "LZW" if output_file.endswith('.tif') or output_file.endswith('.tiff') else ""
-    sitk.WriteImage(result_image, output_file, useCompression=True, compressor=compressor)
+    sitk.WriteImage(result_image, output_file, useCompression=False)
     print(f"[*] Saved to {output_file}")
 
 def infer_folder(

@@ -22,6 +22,9 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+import torch
+
+torch.backends.cudnn.benchmark = True
 
 REPO_ROOT = Path(__file__).resolve().parent
 
@@ -36,16 +39,23 @@ MODEL_ROOT = os.environ.get(
 # 20260611_patch_omen_v2.8_models_for_v2.5_infer.py (checkpoint trainer_name
 # rewritten to a repo trainer; _primus added to Primus plans.json), so they
 # need NO `overwrite_trainer_name` and NO PRIMUS_* env vars.
-MODEL_SUBDIRS = [
+MR_MODEL_SUBDIRS = [
     'resEncM_ceW_bg0.75_max1.5_diff_cluster_noMirror_bs2_ps80_192_128_allLR1e-2_clsBalSamp_degree0.75_noTopcowPretrain_ep1000_DS3',
-    'plain_conv_ceW_bg0.5_max2.5_diff_cluster_noMirror_bs2_ps80_192_128_allLR1e-2_clsBalSamp_degree0.75_noTopcowPretrain_ep1000_DS3',
+    'primusV3S_ceW_bg0.5_max2.5_diff_cluster_noMirror_bs2_ps80_192_128_clsBalSamp_degree0.75_warm50_ep1000_DS',
+]
+
+CT_MODEL_SUBDIRS = [
     'primusV3S_ceW_bg0.5_max2.5_diff_cluster_noMirror_bs2_ps80_192_128_clsBalSamp_degree0.75_warm50_ep1000_DS',
 ]
 
 VIS_SCRIPT = REPO_ROOT / 'nnunetv2/houjing_scripts/vis_label_screenshots_napari_multi_view.py'
 
 
-def build_model_cfg():
+def build_model_cfg(modality='ct', tile_step_size=None):
+    is_ct = str(modality).lower() == 'ct'
+    subdirs = CT_MODEL_SUBDIRS if is_ct else MR_MODEL_SUBDIRS
+    if tile_step_size is None:
+        tile_step_size = 0.95 if is_ct else 0.75
     return [
         dict(
             base_model_dir=MODEL_ROOT,
@@ -53,9 +63,9 @@ def build_model_cfg():
             model_fold=4,
             ckpt_name='checkpoint_final.pth',
             patch_size=None,
-            tile_step_size=0.5,
+            tile_step_size=tile_step_size,
         )
-        for subdir in MODEL_SUBDIRS
+        for subdir in subdirs
     ]
 
 
@@ -68,6 +78,10 @@ def parse_args():
                    help='Input NIfTI file, or a folder searched recursively for *<suffix> files.')
     p.add_argument('-o', '--output', required=True, type=Path,
                    help='Output directory. Sub-folder structure mirrors the input folder.')
+    p.add_argument('--modality', default='ct', choices=['ct', 'mr'],
+                   help='Input imaging modality (ct: PrimusV3S only, mr: resEncM + PrimusV3S).')
+    p.add_argument('--tile_step_size', type=float, default=None,
+                   help='Tile step size for sliding window inference (default: 0.90 for CT, 0.75 for MR).')
     p.add_argument('--suffix', default='.nii.gz',
                    help="Input filename suffix to match; it is stripped from the case name "
                         "(e.g. '_0000.nii.gz' strips the channel suffix from output names).")
@@ -106,45 +120,32 @@ def parse_args():
     p.add_argument('--overwrite_existing', action='store_true',
                    help='Re-run cases whose output file already exists (default: skip them).')
     p.add_argument('--vis', action='store_true',
-                   help='After inference, render multi-view napari screenshot galleries '
-                        'of the predictions (requires xvfb, included in the image).')
-    p.add_argument('--vis_out_dir', type=Path, default=None,
-                   help='Output directory for screenshots (default: <output>/viz, so it '
-                        'lands inside the mounted output volume and is visible on the host).')
-    p.add_argument('--vis_views', nargs='+',
-                   default=['anterior', 'left', 'superior', 'x', 'y', 'z'],
-                   help='Views to render in the screenshot gallery.')
+                   help='Render napari multi-view screenshots after inference.')
+    p.add_argument('--vis_views', nargs='+', default=['sagittal', 'coronal', 'axial'],
+                   help='Views to render when --vis is enabled.')
     p.add_argument('--vis_grid_cols', type=int, default=3,
-                   help='Number of columns in the screenshot gallery.')
+                   help='Number of columns in the visualization screenshot grid.')
     return p.parse_args()
 
 
 def find_cases(input_path: Path, suffix: str):
-    """Return (in_dir, fnames): fnames are suffix-stripped paths relative to in_dir.
-
-    A relative sub-path in an fname is preserved by the inference pipeline, which
-    mirrors it under the output directory.
-    """
     if input_path.is_file():
         if not input_path.name.endswith(suffix):
             sys.exit(f"Input file {input_path} does not end with suffix '{suffix}'")
         return input_path.parent, [input_path.name[:-len(suffix)]]
     if input_path.is_dir():
         fnames = sorted(
-            str(f.relative_to(input_path))[:-len(suffix)]
-            for f in input_path.rglob('*')
-            if f.is_file() and f.name.endswith(suffix)
+            str(p.relative_to(input_path))[:-len(suffix)]
+            for p in input_path.rglob('*')
+            if p.is_file() and p.name.endswith(suffix)
         )
         return input_path, fnames
     sys.exit(f"Input path does not exist: {input_path}")
 
 
-def run_vis(args, in_dir: Path, fnames):
-    # Default inside the output dir: /output is typically a bind mount, so a sibling
-    # like /output_VIZ would land in the container's ephemeral filesystem and be
-    # inaccessible from the host.
-    vis_out_root = args.vis_out_dir or args.output / 'viz'
-    rel_dirs = sorted({os.path.dirname(f) for f in fnames})
+def run_vis(args, in_dir: Path, fnames: list[str]):
+    vis_out_root = args.output / 'visualizations'
+    rel_dirs = sorted({str(Path(f).parent) if Path(f).parent != Path('.') else '' for f in fnames})
     for rel in rel_dirs:
         labels_dir = args.output / rel if rel else args.output
         images_dir = in_dir / rel if rel else in_dir
@@ -174,7 +175,8 @@ def main():
         sys.exit(f"No files matching '*{args.suffix}' found under {args.input}")
     print(f"Found {len(fnames)} case(s) under {in_dir}")
 
-    missing = [d for d in MODEL_SUBDIRS if not (Path(MODEL_ROOT) / d).is_dir()]
+    target_subdirs = CT_MODEL_SUBDIRS if args.modality == 'ct' else MR_MODEL_SUBDIRS
+    missing = [d for d in target_subdirs if not (Path(MODEL_ROOT) / d).is_dir()]
     if missing:
         sys.exit(f"Model weights not found under {MODEL_ROOT}: {missing}")
 
@@ -186,7 +188,7 @@ def main():
         fnames=fnames,
         suffix=args.suffix,
         output_ext=args.output_ext,
-        model_cfg=build_model_cfg(),
+        model_cfg=build_model_cfg(args.modality, args.tile_step_size),
         sequential=args.sequential,
         n_preprocess_workers=args.n_pre_post_workers,
         n_infer_workers=args.n_infer_workers,
@@ -197,8 +199,8 @@ def main():
         gpu_limit_GB=args.gpu_limit_GB,
         fuse_logits=args.fuse_logits,
         fp16=args.fp16,
-        use_mirroring=True,
-        post_process=True,
+        use_mirroring=False,
+        post_process=False,
         skip_existing=not args.overwrite_existing,
     )
 

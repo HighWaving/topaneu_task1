@@ -75,7 +75,7 @@ def _load_model() -> TopAneuVesselAwareClassifier:
     return _MODEL
 
 
-def _run_official_ta36(image: sitk.Image, work_dir: Path) -> tuple[Path, Path]:
+def _run_official_ta36(image: sitk.Image, work_dir: Path, modality: str = "ct") -> tuple[Path, Path]:
     raw_path = work_dir / "raw.nii.gz"
     input_dir = work_dir / "ta36_input"
     output_dir = work_dir / "ta36_output"
@@ -94,13 +94,18 @@ def _run_official_ta36(image: sitk.Image, work_dir: Path) -> tuple[Path, Path]:
     environment["TOPANEU_MODEL_ROOT"] = str(TA36_MODEL_ROOT)
     command = [
         sys.executable,
+        "-u",
         str(TA36_SCRIPT),
         "--input",
         str(input_dir),
         "--output",
         str(output_dir),
+        "--modality",
+        str(modality),
         "--suffix",
         "_0000.nii.gz",
+        "--output_ext",
+        ".nii",
         "--sequential",
         "--n_infer_workers",
         "1",
@@ -112,25 +117,12 @@ def _run_official_ta36(image: sitk.Image, work_dir: Path) -> tuple[Path, Path]:
         check=False,
         cwd=APP_ROOT,
         env=environment,
-        capture_output=True,
-        text=True,
     )
-    print("===== Official TA36 stdout =====", flush=True)
-    print(result.stdout or "", flush=True)
-    print("===== Official TA36 stderr =====", file=sys.stderr, flush=True)
-    print(result.stderr or "", file=sys.stderr, flush=True)
     if result.returncode != 0:
-        stdout = result.stdout or "<empty>"
-        stderr = result.stderr or "<empty>"
         raise RuntimeError(
-            "Official TA36 subprocess failed\n"
-            f"return code: {result.returncode}\n"
-            "===== Official TA36 stdout =====\n"
-            f"{stdout}\n"
-            "===== Official TA36 stderr =====\n"
-            f"{stderr}"
+            f"Official TA36 subprocess failed with return code: {result.returncode}"
         )
-    vessel_path = output_dir / "case.nii.gz"
+    vessel_path = output_dir / "case.nii"
     if not vessel_path.is_file():
         raise RuntimeError(f"Official TA36 did not produce {vessel_path}")
     return lps_path, vessel_path
@@ -141,7 +133,7 @@ def _predict(image: sitk.Image, modality: str) -> list[int]:
         raise ValueError(f"unsupported modality: {modality}")
     config = _load_config()
     with tempfile.TemporaryDirectory(prefix=f"topaneu-task1-{modality}-", dir="/tmp") as temporary:
-        image_path, vessel_path = _run_official_ta36(image, Path(temporary))
+        image_path, vessel_path = _run_official_ta36(image, Path(temporary), modality=modality)
         image_tensor, vessel_tensor = preprocess_case(image_path, vessel_path)
         if tuple(image_tensor.shape) != (1, 128, 256, 256):
             raise RuntimeError(f"unexpected preprocessed image shape: {tuple(image_tensor.shape)}")
