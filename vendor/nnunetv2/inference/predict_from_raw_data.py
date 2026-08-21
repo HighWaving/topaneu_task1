@@ -833,9 +833,22 @@ class nnUNetPredictor(object):
             buf_start = 0
             max_step_z = int(np.max(np.diff(z_steps))) if len(z_steps) > 1 else 0
             buf_len = min(d_padded, pz + max_step_z + 10)
-            buf_device = self.device if (self.device.type == 'cuda' and torch.cuda.get_device_properties(self.device).total_memory >= 12 * 1024**3) else torch.device('cpu')
+            req_ring_bytes = (C + 1) * buf_len * h_padded * w_padded * 2  # FP16 logits + npred
+            forward_peak_and_reserve = 5.5 * 1024**3  # measured forward peak (3.93 GiB) + allocator/workspace safety margin (1.57 GiB)
+            if self.device.type == 'cuda' and (req_ring_bytes + forward_peak_and_reserve <= torch.cuda.get_device_properties(self.device).total_memory):
+                buf_device = self.device
+            else:
+                buf_device = torch.device('cpu')
+
             logits_buf = torch.zeros((C, buf_len, h_padded, w_padded), dtype=torch.half, device=buf_device)
             npred_buf = torch.zeros((buf_len, h_padded, w_padded), dtype=torch.half, device=buf_device)
+
+            buf_bytes = logits_buf.numel() * logits_buf.element_size()
+            print(f"[*] Streamed ring buffer: shape={logits_buf.shape}, dtype={logits_buf.dtype}, size={buf_bytes / (1024**3):.2f} GiB ({buf_bytes} bytes) on {buf_device}", flush=True)
+            print(f"[*] Memory check: required_ring={req_ring_bytes / 1024**3:.2f} GiB, forward_peak_reserve={forward_peak_and_reserve / 1024**3:.2f} GiB -> chosen device: {buf_device}", flush=True)
+            if buf_device.type == 'cuda':
+                free_b, tot_b = torch.cuda.mem_get_info()
+                print(f"[*] Initial CUDA mem: allocated={torch.cuda.memory_allocated() / (1024**3):.2f} GiB, reserved={torch.cuda.memory_reserved() / (1024**3):.2f} GiB, free={free_b / (1024**3):.2f} GiB / {tot_b / (1024**3):.2f} GiB", flush=True)
 
             import time
             z_src_finalized = 0
@@ -852,13 +865,28 @@ class nnUNetPredictor(object):
                         if self.use_gaussian:
                             prediction = prediction * gaussian_gpu
 
-                        rel_z = slice(sz - buf_start, sz + pz - buf_start)
-                        if buf_device.type == 'cuda':
-                            logits_buf[:, rel_z, slice(sy, sy + py), slice(sx, sx + px)] += prediction
-                            npred_buf[rel_z, slice(sy, sy + py), slice(sx, sx + px)] += gaussian_gpu if self.use_gaussian else 1
+                        r_0 = sz % buf_len
+                        if r_0 + pz <= buf_len:
+                            if buf_device.type == 'cuda':
+                                logits_buf[:, r_0 : r_0 + pz, sy:sy+py, sx:sx+px] += prediction
+                                npred_buf[r_0 : r_0 + pz, sy:sy+py, sx:sx+px] += gaussian_gpu if self.use_gaussian else 1
+                            else:
+                                logits_buf[:, r_0 : r_0 + pz, sy:sy+py, sx:sx+px] += prediction.cpu()
+                                npred_buf[r_0 : r_0 + pz, sy:sy+py, sx:sx+px] += gaussian_cpu
                         else:
-                            logits_buf[:, rel_z, slice(sy, sy + py), slice(sx, sx + px)] += prediction.cpu()
-                            npred_buf[rel_z, slice(sy, sy + py), slice(sx, sx + px)] += gaussian_cpu
+                            len1 = buf_len - r_0
+                            len2 = pz - len1
+                            if buf_device.type == 'cuda':
+                                logits_buf[:, r_0 : buf_len, sy:sy+py, sx:sx+px] += prediction[:, :len1]
+                                npred_buf[r_0 : buf_len, sy:sy+py, sx:sx+px] += (gaussian_gpu[:len1] if self.use_gaussian else 1)
+                                logits_buf[:, :len2, sy:sy+py, sx:sx+px] += prediction[:, len1:]
+                                npred_buf[:len2, sy:sy+py, sx:sx+px] += (gaussian_gpu[len1:] if self.use_gaussian else 1)
+                            else:
+                                pred_cpu = prediction.cpu()
+                                logits_buf[:, r_0 : buf_len, sy:sy+py, sx:sx+px] += pred_cpu[:, :len1]
+                                npred_buf[r_0 : buf_len, sy:sy+py, sx:sx+px] += (gaussian_cpu[:len1] if self.use_gaussian else 1)
+                                logits_buf[:, :len2, sy:sy+py, sx:sx+px] += pred_cpu[:, len1:]
+                                npred_buf[:len2, sy:sy+py, sx:sx+px] += (gaussian_cpu[len1:] if self.use_gaussian else 1)
 
                 t_infer_k = time.time() - t_k0
                 print(f"[*] Streamed Z-step {k+1}/{len(z_steps)} forward in {t_infer_k:.2f}s", flush=True)
@@ -888,9 +916,13 @@ class nnUNetPredictor(object):
                             min_i = int(i0_gpu.min().item())
                             max_i = min(d_padded, int(i1_gpu.max().item()) + 1)
 
-                            rel_min_i = min_i - buf_start
-                            rel_max_i = max_i - buf_start
-                            sub_logits = (logits_buf[:, rel_min_i:rel_max_i] / npred_buf[rel_min_i:rel_max_i]).float()
+                            r_min = min_i % buf_len
+                            if r_min + (max_i - min_i) <= buf_len:
+                                sub_logits = (logits_buf[:, r_min : r_min + (max_i - min_i)] / npred_buf[r_min : r_min + (max_i - min_i)]).float()
+                            else:
+                                phys_indices = [(z % buf_len) for z in range(min_i, max_i)]
+                                sub_logits = (logits_buf[:, phys_indices] / npred_buf[phys_indices]).float()
+
                             if buf_device.type != 'cuda':
                                 sub_logits = sub_logits.to(self.device)
 
@@ -910,12 +942,27 @@ class nnUNetPredictor(object):
                         next_sz = z_steps[k + 1]
                         next_needed_src = max(0, int(math.floor((z_out_finalized + 0.5) * d_padded / d_out - 0.5)))
                         new_buf_start = min(next_sz, next_needed_src)
-                        shift = new_buf_start - buf_start
-                        if shift > 0 and shift < buf_len:
-                            logits_buf = torch.roll(logits_buf, -shift, dims=1)
-                            logits_buf[:, -shift:] = 0
-                            npred_buf = torch.roll(npred_buf, -shift, dims=0)
-                            npred_buf[-shift:] = 0
+                        count = new_buf_start - buf_start
+                        if count > 0:
+                            if buf_device.type == 'cuda':
+                                free_b, tot_b = torch.cuda.mem_get_info()
+                                print(f"[*] Advance ring window [{buf_start} -> {new_buf_start}): allocated={torch.cuda.memory_allocated() / (1024**3):.2f} GiB, reserved={torch.cuda.memory_reserved() / (1024**3):.2f} GiB, free={free_b / (1024**3):.2f} GiB", flush=True)
+
+                            r_a = buf_start % buf_len
+                            if count >= buf_len:
+                                logits_buf.zero_()
+                                npred_buf.zero_()
+                            elif r_a + count <= buf_len:
+                                logits_buf[:, r_a : r_a + count].zero_()
+                                npred_buf[r_a : r_a + count].zero_()
+                            else:
+                                len1 = buf_len - r_a
+                                len2 = count - len1
+                                logits_buf[:, r_a : buf_len].zero_()
+                                logits_buf[:, :len2].zero_()
+                                npred_buf[r_a : buf_len].zero_()
+                                npred_buf[:len2].zero_()
+
                             buf_start = new_buf_start
 
                     z_src_finalized = z_src_now_finalized

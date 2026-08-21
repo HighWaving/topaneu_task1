@@ -92,6 +92,7 @@ def _run_official_ta36(image: sitk.Image, work_dir: Path, modality: str = "ct") 
 
     environment = os.environ.copy()
     environment["TOPANEU_MODEL_ROOT"] = str(TA36_MODEL_ROOT)
+    environment["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     command = [
         sys.executable,
         "-u",
