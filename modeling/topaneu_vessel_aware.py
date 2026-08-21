@@ -128,6 +128,7 @@ class TopAneuVesselAwareClassifier(nn.Module):
         return torch.cat((masked_mean, global_mean), dim=-1)
 
     def forward(self, image: torch.Tensor, vessel_mask: torch.Tensor) -> torch.Tensor:
+        print(f"[*] Backbone input: shape={image.shape}, dtype={image.dtype}, device={image.device}", flush=True)
         try:
             out: Any = self.backbone(
                 image,

@@ -318,6 +318,7 @@ class AneurysmRoiBackboneNnUNetTruncatedDecoder(AneurysmRoiBackboneNnUNet):
         self, x: torch.Tensor, vessel_seg: torch.Tensor, vessel_union: torch.Tensor
     ) -> dict[str, torch.Tensor]:
         # Get encoder skip connections
+        print(f"[*] nnUNet Encoder Input: x.shape={x.shape}, x.dtype={x.dtype}, estimated tensor bytes={x.numel() * x.element_size()} bytes ({x.numel() * x.element_size() / 1024**2:.2f} MiB)", flush=True)
         skips = self.nnunet.encoder(x)
         # Run decoder up to the cutoff and get features
         dec_feat_trunc = self._forward_decoder_to_last_feature(skips)

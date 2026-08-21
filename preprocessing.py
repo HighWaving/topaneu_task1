@@ -91,6 +91,10 @@ def preprocess_case(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     image_nii = nib.load(str(image_path))
     vessel_nii = nib.load(str(vessel_path))
+    print(f"[*] Preprocess Case Input:", flush=True)
+    print(f"    Image NIfTI: shape={image_nii.shape}, zooms={image_nii.header.get_zooms()[:3]}, orientation={''.join(nib.aff2axcodes(image_nii.affine))}, dtype={image_nii.get_data_dtype()}", flush=True)
+    print(f"    Vessel NIfTI: shape={vessel_nii.shape}, zooms={vessel_nii.header.get_zooms()[:3]}, orientation={''.join(nib.aff2axcodes(vessel_nii.affine))}, dtype={vessel_nii.get_data_dtype()}", flush=True)
+
     if image_nii.shape != vessel_nii.shape:
         raise ValueError("TA36 output shape does not match the input image")
     if not np.allclose(image_nii.affine, vessel_nii.affine, rtol=1e-5, atol=1e-4):
@@ -111,12 +115,24 @@ def preprocess_case(
     image_zyx = image_xyz.transpose(2, 1, 0)
     vessel_zyx = vessel_xyz.transpose(2, 1, 0)
     spacing_zyx = tuple(reversed(image_nii.header.get_zooms()[:3]))
+    
+    # Nonzero and ROI statistics
+    nz_voxels = int(np.count_nonzero(vessel_zyx))
+    nz_frac = nz_voxels / max(vessel_zyx.size, 1)
+    unq_labels = np.unique(vessel_zyx).tolist()
     crop = _vessel_bbox(vessel_zyx, spacing_zyx, VESSEL_MARGIN_MM)
+    print(f"[*] Vessel Mask Statistics: unique_labels={unq_labels}, nonzero_voxels={nz_voxels}, nonzero_fraction={nz_frac:.6f}, bbox={crop}", flush=True)
+
     image_zyx = image_zyx[crop]
     vessel_zyx = vessel_zyx[crop]
+    print(f"[*] After ROI crop: image_zyx.shape={image_zyx.shape}, vessel_zyx.shape={vessel_zyx.shape}", flush=True)
+
     mean = float(image_zyx.mean())
     std = float(image_zyx.std())
     image_zyx = (image_zyx - mean) / max(std, 1e-6)
     image = torch.from_numpy(np.ascontiguousarray(image_zyx[None])).float()
     vessel = torch.from_numpy(np.ascontiguousarray(vessel_zyx[None]))
-    return _resize_z_xy(image, vessel, INPUT_SIZE)
+    
+    img_out, ves_out = _resize_z_xy(image, vessel, INPUT_SIZE)
+    print(f"[*] After _resize_z_xy (final preprocessed): img_out={img_out.shape} (dtype={img_out.dtype}, min={img_out.min():.2f}, max={img_out.max():.2f}), ves_out={ves_out.shape} (dtype={ves_out.dtype}, unique={torch.unique(ves_out).tolist()})", flush=True)
+    return img_out, ves_out
