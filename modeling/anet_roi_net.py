@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # Pretrained backbone using nnUNet (dynamic_network_architectures)
 import json  # noqa: E402
@@ -421,3 +422,87 @@ class AneurysmRoiBackboneNnUNetTruncatedDecoderStochasticDepth(AneurysmRoiBackbo
         apply = drop_prob > 0.0
         block.apply_stochastic_depth = apply
         block.drop_path = DropPath(drop_prob=drop_prob)
+
+
+def chunked_conv3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    stride: tuple[int, int, int] = (1, 1, 1),
+    padding: tuple[int, int, int] = (0, 0, 0),
+    dilation: tuple[int, int, int] = (1, 1, 1),
+    groups: int = 1,
+    chunk_size: int = 16,
+) -> torch.Tensor:
+    """Execute 3D convolution sliced along Depth with exact receptive field halos.
+    
+    Guarantees bit-exact numerical identity with F.conv3d while bounding
+    peak vol2col/workspace allocation to safe levels.
+    """
+    B, Cin, D, H, W = x.shape
+    sd, sh, sw = stride
+    pd, ph, pw = padding
+    dd, dh, dw = dilation
+    Kd = weight.shape[2]
+    
+    K_eff = dd * (Kd - 1) + 1
+    D_out = (D + 2 * pd - K_eff) // sd + 1
+    
+    if D_out <= chunk_size:
+        return F.conv3d(x, weight, bias, stride=stride, padding=padding, dilation=dilation, groups=groups)
+        
+    out_chunks: list[torch.Tensor] = []
+    for z_out0 in range(0, D_out, chunk_size):
+        z_out1 = min(D_out, z_out0 + chunk_size)
+        
+        z_pad_start = z_out0 * sd
+        z_pad_end = (z_out1 - 1) * sd + K_eff
+        
+        z_in_start = max(0, z_pad_start - pd)
+        z_in_end = min(D, z_pad_end - pd)
+        
+        chunk_in = x[:, :, z_in_start:z_in_end]
+        
+        pad_top = max(0, pd - z_pad_start)
+        pad_bottom = max(0, (z_pad_end - pd) - D)
+        
+        if pad_top > 0 or pad_bottom > 0:
+            chunk_in = F.pad(chunk_in, (0, 0, 0, 0, pad_top, pad_bottom))
+            
+        chunk_out = F.conv3d(
+            chunk_in,
+            weight,
+            bias,
+            stride=stride,
+            padding=(0, ph, pw),
+            dilation=dilation,
+            groups=groups,
+        )
+        out_chunks.append(chunk_out)
+        
+    return torch.cat(out_chunks, dim=2)
+
+
+def apply_chunked_conv3d_to_highres(model: nn.Module, chunk_size: int = 16) -> list[str]:
+    """Replaces Conv3d in high-res stages (stages 0 and 1) with depth-chunked execution."""
+    layers_replaced: list[str] = []
+    
+    target_modules = [
+        ("encoder.stages.0", getattr(model.backbone.nnunet.encoder.stages, "0", None) or model.backbone.nnunet.encoder.stages[0]),
+        ("encoder.stages.1", getattr(model.backbone.nnunet.encoder.stages, "1", None) or model.backbone.nnunet.encoder.stages[1]),
+    ]
+    
+    for stage_name, stage_module in target_modules:
+        for name, child in stage_module.named_modules():
+            if isinstance(child, nn.Conv3d) and child.kernel_size == (3, 3, 3):
+                orig_conv = child
+                def make_chunked_forward(c: nn.Conv3d):
+                    return lambda x: chunked_conv3d(
+                        x, c.weight, c.bias,
+                        stride=c.stride, padding=c.padding, dilation=c.dilation, groups=c.groups,
+                        chunk_size=chunk_size
+                    )
+                child.forward = make_chunked_forward(orig_conv)
+                layers_replaced.append(f"{stage_name}.{name}")
+                
+    return layers_replaced

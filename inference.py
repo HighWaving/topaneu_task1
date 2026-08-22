@@ -141,20 +141,34 @@ def _predict(image: sitk.Image, modality: str) -> list[int]:
         if tuple(vessel_tensor.shape) != (1, 128, 256, 256):
             raise RuntimeError(f"unexpected preprocessed vessel shape: {tuple(vessel_tensor.shape)}")
         model = _load_model()
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
+        from modeling.anet_roi_net import apply_chunked_conv3d_to_highres
+        replaced_layers = apply_chunked_conv3d_to_highres(model, chunk_size=16)
+        print(f"[*] Stage-2 ChunkedConv3D enabled: {len(replaced_layers)} high-res Conv3D layers patched (chunk_size=16)", flush=True)
 
         img_gpu = image_tensor.unsqueeze(0).cuda(non_blocking=True)
         ves_gpu = vessel_tensor.unsqueeze(0).cuda(non_blocking=True)
 
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
         free_b, tot_b = torch.cuda.mem_get_info()
         print(f"[*] Stage-2 CUDA Memory before inference: allocated={torch.cuda.memory_allocated()/1024**3:.3f} GiB, reserved={torch.cuda.memory_reserved()/1024**3:.3f} GiB, free={free_b/1024**3:.3f} GiB / {tot_b/1024**3:.3f} GiB", flush=True)
         print(f"[*] Stage-2 Tensor Inputs to model(...):", flush=True)
         print(f"    image: shape={img_gpu.shape}, dtype={img_gpu.dtype}, device={img_gpu.device}, numel={img_gpu.numel()}, size={img_gpu.numel() * img_gpu.element_size() / 1024**2:.2f} MiB, min={img_gpu.min():.2f}, max={img_gpu.max():.2f}", flush=True)
         print(f"    vessel: shape={ves_gpu.shape}, dtype={ves_gpu.dtype}, device={ves_gpu.device}, numel={ves_gpu.numel()}, size={ves_gpu.numel() * ves_gpu.element_size() / 1024**2:.2f} MiB, unique={torch.unique(ves_gpu).tolist()}", flush=True)
 
-        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16):
+        import time
+        t_stage2_start = time.time()
+        with torch.inference_mode():
             logits = model(img_gpu, ves_gpu)
+        torch.cuda.synchronize()
+        t_stage2 = time.time() - t_stage2_start
+
+        peak_alloc = torch.cuda.max_memory_allocated()
+        peak_res = torch.cuda.max_memory_reserved()
+        free_b_after, _ = torch.cuda.mem_get_info()
+        print(f"[*] Stage-2 FP32 forward completed in {t_stage2:.4f} s (ChunkedConv3D chunk_size=16)", flush=True)
+        print(f"[*] Stage-2 Peak CUDA Memory: allocated={peak_alloc/1024**3:.3f} GiB, reserved={peak_res/1024**3:.3f} GiB, free={free_b_after/1024**3:.3f} GiB", flush=True)
         print(f"[*] Stage-2 model output logits: shape={logits.shape}, finite={torch.isfinite(logits).all()}", flush=True)
         if tuple(logits.shape) != (1, 52) or not torch.isfinite(logits).all():
             raise RuntimeError("Task 1 classifier did not produce 52 finite logits")
