@@ -17,8 +17,11 @@ import nibabel as nib
 import SimpleITK as sitk
 import torch
 
-from modeling import AneurysmRoiBackboneNnUNetTruncatedDecoder
-from modeling import TopAneuVesselAwareClassifier
+from modeling import (
+    AneurysmRoiBackboneNnUNetTruncatedDecoder,
+    MODEL_CLASSES,
+    TopAneuVesselAwareClassifier,
+)
 from preprocessing import preprocess_case
 from ta36.reorient_nii import reorient_nii
 
@@ -31,7 +34,7 @@ STAGE2_NNUNET_DIR = MODEL_ROOT / "stage2_nnunet"
 TA36_MODEL_ROOT = MODEL_ROOT / "ta36_models"
 TA36_SCRIPT = APP_ROOT / "ta36" / "run_inference.py"
 
-_MODEL: TopAneuVesselAwareClassifier | None = None
+_MODEL: torch.nn.Module | None = None
 _CONFIG: dict | None = None
 
 
@@ -44,7 +47,7 @@ def _load_config() -> dict:
     return _CONFIG
 
 
-def _load_model() -> TopAneuVesselAwareClassifier:
+def _load_model() -> torch.nn.Module:
     global _MODEL
     if _MODEL is not None:
         return _MODEL
@@ -60,15 +63,24 @@ def _load_model() -> TopAneuVesselAwareClassifier:
         out_channels=None,
         num_truncate_stages=config["num_truncate_stages"],
     )
-    model = TopAneuVesselAwareClassifier(
-        backbone,
-        backbone.feature_channels(),
+    class_name = config.get("model_class", "TopAneuVesselAwareClassifier")
+    if class_name not in MODEL_CLASSES:
+        raise RuntimeError(f"unknown model_class {class_name!r}")
+    kwargs = dict(
         num_vessel_classes=config["num_vessel_classes"],
         num_outputs=config["num_outputs"],
         embed_dim=config["embed_dim"],
         transformer_heads=config["transformer_heads"],
         transformer_layers=config["transformer_layers"],
     )
+    if class_name in {"TopAneuLocationTokenClassifier", "TopAneuDenseSupervised"}:
+        from modeling.location_attachment import build_attachment
+
+        attachment, _ = build_attachment(
+            MODEL_ROOT / "location_mapping.json", MODEL_ROOT / "vessel_mapping.json"
+        )
+        kwargs["attachment"] = attachment
+    model = MODEL_CLASSES[class_name](backbone, backbone.feature_channels(), **kwargs)
     payload = torch.load(CHECKPOINT_PATH, map_location="cpu", weights_only=False)
     model.load_state_dict(payload["model"], strict=True)
     _MODEL = model.cuda().eval()
@@ -173,11 +185,24 @@ def _predict(image: sitk.Image, modality: str) -> list[int]:
         if tuple(logits.shape) != (1, 52) or not torch.isfinite(logits).all():
             raise RuntimeError("Task 1 classifier did not produce 52 finite logits")
         probabilities = torch.sigmoid(logits)[0].float().cpu().tolist()
-    threshold = float(config["output_threshold"])
-    labels = [index + 1 for index, probability in enumerate(probabilities) if probability >= threshold]
+    labels = _decide_labels(probabilities, config)
     if any(type(label) is not int or not 1 <= label <= 52 for label in labels):
         raise RuntimeError("invalid Task 1 label mapping")
     return labels
+
+
+def _decide_labels(probabilities: list[float], config: dict) -> list[int]:
+    """Apply the locked scalar threshold; probability index 0 maps to location 1."""
+    import math
+    if len(probabilities) != 52 or not all(math.isfinite(p) and 0 <= p <= 1 for p in probabilities):
+        raise ValueError("Expected 52 finite probabilities in [0, 1]")
+    if config.get("decision_policy") != "global_threshold":
+        # Fallback to output_threshold if decision_policy is not explicitly set
+        pass
+    threshold = float(config["output_threshold"])
+    if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+        raise ValueError("Invalid output_threshold")
+    return [i + 1 for i, p in enumerate(probabilities) if p >= threshold]
 
 
 def infer_ct(image: sitk.Image) -> list[int]:
