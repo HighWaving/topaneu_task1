@@ -16,12 +16,16 @@ OUTPUT_PATH = Path("/output")
 OUTPUT_FILE = OUTPUT_PATH / "detected-aneurysm-locations.json"
 
 IMAGE_EXTENSIONS = (
-    ".nii.gz",
-    ".nii",
     ".mha",
     ".mhd",
-    ".tif",
     ".tiff",
+    ".tif",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".nii.gz",
+    ".nii",
+    ".dcm",
 )
 
 
@@ -36,7 +40,7 @@ def find_image_files(location: Path) -> list[Path]:
 
     found = []
     # 1. Search immediate directory
-    for item in location.iterdir():
+    for item in sorted(location.iterdir()):
         if item.is_file():
             name_lower = item.name.lower()
             if any(name_lower.endswith(ext) for ext in IMAGE_EXTENSIONS):
@@ -44,13 +48,13 @@ def find_image_files(location: Path) -> list[Path]:
 
     # 2. If nothing found directly, search recursively
     if not found:
-        for item in location.rglob("*"):
+        for item in sorted(location.rglob("*")):
             if item.is_file():
                 name_lower = item.name.lower()
                 if any(name_lower.endswith(ext) for ext in IMAGE_EXTENSIONS):
                     found.append(item)
 
-    return sorted(found)
+    return found
 
 
 def load_image_file(location: Path) -> SimpleITK.Image:
@@ -61,9 +65,32 @@ def load_image_file(location: Path) -> SimpleITK.Image:
     if not input_files:
         raise RuntimeError(f"Expected image file in {location}, found 0 files matching {IMAGE_EXTENSIONS}")
 
-    chosen = input_files[0]
-    print(f"[*] Found {len(input_files)} candidate image(s) in {location}. Loading: {chosen}", flush=True)
-    return SimpleITK.ReadImage(str(chosen))
+    print(f"[*] Found {len(input_files)} candidate image file(s) in {location}.", flush=True)
+
+    if len(input_files) == 1:
+        img = SimpleITK.ReadImage(str(input_files[0]))
+    else:
+        # Check if single 3D volume file exists among files
+        vol_files = [f for f in input_files if f.name.lower().endswith((".mha", ".nii.gz", ".nii"))]
+        if len(vol_files) == 1:
+            img = SimpleITK.ReadImage(str(vol_files[0]))
+        else:
+            # Multi-slice series (e.g. 2D PNG / TIFF / DCM series)
+            try:
+                reader = SimpleITK.ImageSeriesReader()
+                sorted_files = sorted(input_files, key=lambda p: p.name)
+                reader.SetFileNames([str(p) for p in sorted_files])
+                img = reader.Execute()
+                print(f"[*] Successfully loaded {len(sorted_files)} slices as 3D volume via ImageSeriesReader.", flush=True)
+            except Exception as series_err:
+                print(f"[*] ImageSeriesReader failed ({series_err}), falling back to first file: {input_files[0]}", file=sys.stderr)
+                img = SimpleITK.ReadImage(str(input_files[0]))
+
+    if img.GetDimension() == 2:
+        print("[*] Input image is 2D, expanding to 3D via JoinSeries.", flush=True)
+        img = SimpleITK.JoinSeries([img])
+
+    return img
 
 
 def get_interface_key() -> tuple[str, ...]:
