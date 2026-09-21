@@ -495,6 +495,8 @@ def apply_chunked_conv3d_to_highres(model: nn.Module, chunk_size: int = 16) -> l
     for stage_name, stage_module in target_modules:
         for name, child in stage_module.named_modules():
             if isinstance(child, nn.Conv3d) and child.kernel_size == (3, 3, 3):
+                if getattr(child, "_is_chunked", False):
+                    continue
                 orig_conv = child
                 def make_chunked_forward(c: nn.Conv3d):
                     return lambda x: chunked_conv3d(
@@ -503,6 +505,7 @@ def apply_chunked_conv3d_to_highres(model: nn.Module, chunk_size: int = 16) -> l
                         chunk_size=chunk_size
                     )
                 child.forward = make_chunked_forward(orig_conv)
+                child._is_chunked = True
                 layers_replaced.append(f"{stage_name}.{name}")
                 
     return layers_replaced

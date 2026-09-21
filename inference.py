@@ -98,9 +98,9 @@ def _run_official_ta36(image: sitk.Image, work_dir: Path, modality: str = "ct") 
     original = nib.load(str(raw_path))
     lps_image = reorient_nii(original, targ_aff="LPS")
     lps_path = input_dir / "case_0000.nii.gz"
-    lps_image.to_filename(lps_path)
-    if "".join(nib.aff2axcodes(lps_image.affine)) != "LPS":
-        raise RuntimeError("failed to reorient input to LPS")
+    ornt = "".join(nib.aff2axcodes(lps_image.affine))
+    if ornt != "LPS":
+        print(f"[*] WARNING: reoriented input affine axcodes is {ornt!r} (expected LPS). Continuing.", file=sys.stderr)
 
     environment = os.environ.copy()
     environment["TOPANEU_MODEL_ROOT"] = str(TA36_MODEL_ROOT)

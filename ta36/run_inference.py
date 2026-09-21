@@ -40,7 +40,6 @@ MODEL_ROOT = os.environ.get(
 # rewritten to a repo trainer; _primus added to Primus plans.json), so they
 # need NO `overwrite_trainer_name` and NO PRIMUS_* env vars.
 MR_MODEL_SUBDIRS = [
-    'resEncM_ceW_bg0.75_max1.5_diff_cluster_noMirror_bs2_ps80_192_128_allLR1e-2_clsBalSamp_degree0.75_noTopcowPretrain_ep1000_DS3',
     'primusV3S_ceW_bg0.5_max2.5_diff_cluster_noMirror_bs2_ps80_192_128_clsBalSamp_degree0.75_warm50_ep1000_DS',
 ]
 
@@ -55,7 +54,7 @@ def build_model_cfg(modality='ct', tile_step_size=None):
     is_ct = str(modality).lower() == 'ct'
     subdirs = CT_MODEL_SUBDIRS if is_ct else MR_MODEL_SUBDIRS
     if tile_step_size is None:
-        tile_step_size = 0.95 if is_ct else 0.75
+        tile_step_size = 0.95 if is_ct else 0.85
     return [
         dict(
             base_model_dir=MODEL_ROOT,

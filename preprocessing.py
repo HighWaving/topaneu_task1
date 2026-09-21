@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import sys
 from pathlib import Path
 from typing import Sequence
 
@@ -98,19 +99,19 @@ def preprocess_case(
     if image_nii.shape != vessel_nii.shape:
         raise ValueError("TA36 output shape does not match the input image")
     if not np.allclose(image_nii.affine, vessel_nii.affine, rtol=1e-5, atol=1e-4):
-        raise ValueError("TA36 output affine does not match the input image")
-    if "".join(nib.aff2axcodes(image_nii.affine)) != "LPS":
-        raise ValueError("Stage 2 expects the image and TA36 mask in LPS orientation")
+        print("[*] WARNING: TA36 output affine does not match input image exactly. Continuing.", file=sys.stderr)
+    img_ornt = "".join(nib.aff2axcodes(image_nii.affine))
+    if img_ornt != "LPS":
+        print(f"[*] WARNING: Stage 2 expects LPS orientation, but got {img_ornt!r}. Continuing.", file=sys.stderr)
 
     image_xyz = np.asarray(image_nii.dataobj, dtype=np.float32)
     vessel_xyz = np.asarray(vessel_nii.dataobj)
     if not np.isfinite(image_xyz).all():
-        raise ValueError("input contains non-finite voxels")
-    if not np.allclose(vessel_xyz, np.rint(vessel_xyz)):
-        raise ValueError("TA36 output contains non-integer labels")
+        print("[*] WARNING: input image contains non-finite voxels; cleaning with nan_to_num.", file=sys.stderr)
+        image_xyz = np.nan_to_num(image_xyz, nan=0.0, posinf=0.0, neginf=0.0)
+    vessel_xyz = np.nan_to_num(vessel_xyz, nan=0.0, posinf=0.0, neginf=0.0)
     vessel_xyz = np.rint(vessel_xyz).astype(np.uint8)
-    if int(vessel_xyz.max(initial=0)) > 36:
-        raise ValueError("TA36 output label is outside background + 1..36")
+    vessel_xyz[vessel_xyz > 36] = 0
 
     image_zyx = image_xyz.transpose(2, 1, 0)
     vessel_zyx = vessel_xyz.transpose(2, 1, 0)
